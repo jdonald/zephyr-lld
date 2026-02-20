@@ -1,0 +1,37 @@
+diff --git a/soc/renesas/ra/ra4m1/rom_start.ld b/soc/renesas/ra/ra4m1/rom_start.ld
+index 14d4ca67377..af2e4d96226 100644
+--- a/soc/renesas/ra/ra4m1/rom_start.ld
++++ b/soc/renesas/ra/ra4m1/rom_start.ld
+@@ -7,11 +7,32 @@
+ 
+ #include <zephyr/devicetree.h>
+ 
++/*
++ * GNU ld treats `. = <constant>` inside an output section as section-relative,
++ * so `. = 1024` means "offset 1024 from the section start".
++ * LLVM lld treats the same expression as absolute, causing a backward-move
++ * error when the constant is less than the section's VMA.
++ *
++ * Adding __rom_start_address (defined at the start of rom_start) makes the
++ * expression absolute in both linkers and produces the same VMA.
++ */
++#ifdef __LLD_LINKER_CMD__
++. = __rom_start_address + DT_REG_ADDR(DT_NODELABEL(option_setting_ofs0));
++#else
+ . = DT_REG_ADDR(DT_NODELABEL(option_setting_ofs0));
++#endif
+ KEEP(*(.option_setting_ofs0))
+ 
++#ifdef __LLD_LINKER_CMD__
++. = __rom_start_address + DT_REG_ADDR(DT_NODELABEL(option_setting_ofs1));
++#else
+ . = DT_REG_ADDR(DT_NODELABEL(option_setting_ofs1));
++#endif
+ KEEP(*(.option_setting_ofs1))
+ 
++#ifdef __LLD_LINKER_CMD__
++. = __rom_start_address + DT_REG_ADDR(DT_NODELABEL(option_setting_secmpu));
++#else
+ . = DT_REG_ADDR(DT_NODELABEL(option_setting_secmpu));
++#endif
+ KEEP(*(.option_setting_secmpu))

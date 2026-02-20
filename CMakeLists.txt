@@ -4,4 +4,4 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(shave_and_a_haircut)
 
-target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE src/main.c src/syscall_stubs.c)

@@ -91,7 +91,7 @@ or, with an explicit build directory:
 west build -b arduino_uno_r4@minima -d build-bfd
 ```
 
-### Build with lld Linker (Experimental)
+### Build with lld Linker
 
 This project includes a custom `zephyr-lld` toolchain variant that uses the
 GCC cross-compiler from the Zephyr SDK with LLVM's `ld.lld` as the linker.
@@ -112,12 +112,18 @@ To use it:
    ln -sf /opt/homebrew/opt/llvm/bin/ld.lld "${ZEPHYR_SDK_INSTALL_DIR}/arm-zephyr-eabi/arm-zephyr-eabi/bin/ld.lld"
    ```
 
-3. **Build** with the custom toolchain variant:
+3. **Apply the Zephyr source patch** (see [Upstream Fixes Required](#upstream-fixes-required)):
 
    ```bash
-   export ZEPHYR_TOOLCHAIN_VARIANT=zephyr-lld
-   export TOOLCHAIN_ROOT=$(pwd)   # must point to this repository root
-   west build -b arduino_uno_r4@minima -d build-lld
+   cd $ZEPHYR_BASE
+   git apply /path/to/zephyr-lld/patches/0001-soc-renesas-ra4m1-lld-compat-rom_start.ld.patch
+   ```
+
+4. **Build** with the custom toolchain variant:
+
+   ```bash
+   west build -b arduino_uno_r4@minima -d build-lld \
+     -- -DZEPHYR_TOOLCHAIN_VARIANT=zephyr-lld -DTOOLCHAIN_ROOT=$(pwd)
    ```
 
 ### Verifying the Linker Knob
@@ -168,48 +174,76 @@ When `TOOLCHAIN_ROOT` points to this repository and
 `ZEPHYR_TOOLCHAIN_VARIANT` is set to `zephyr-lld`, Zephyr's build system
 picks up the overridden linker configuration.
 
-## Known lld Linker Issues
+## Workarounds Applied for lld Compatibility
 
-As of Zephyr 4.x and LLVM lld 18.x, linking a Zephyr firmware image for the
-Arduino Uno R4 Minima with `ld.lld` **does not fully succeed**. The
-CMake configuration and compilation complete, and `build.ninja` correctly
-contains `-fuse-ld=lld` in all link steps. However, the actual link step
-fails with the following categories of errors:
+Three categories of issues prevent a stock Zephyr build from linking with
+`ld.lld`. This project includes workarounds for all three:
 
-### 1. Duplicate Symbol Errors
+### 1. Duplicate `__retarget_lock_*` Symbols
 
+**Problem:** Zephyr's picolibc lock wrappers (in `lib/libc/picolibc/locks.c`,
+pulled in via `--whole-archive`) and the SDK's bundled picolibc both define
+strong `__retarget_lock_*` symbols. GNU ld silently uses the first definition
+encountered; lld is strict and errors on duplicates.
+
+**Workaround:** The custom `cmake/linker/lld/linker_flags.cmake` adds
+`-Wl,--allow-multiple-definition` to the lld link flags.
+
+**Upstream fix:** Zephyr should declare its picolibc lock wrappers as
+`__attribute__((weak))`, or the SDK should build picolibc without the
+conflicting strong definitions.
+
+### 2. Linker Script Section Placement (`rom_start.ld`)
+
+**Problem:** The Renesas RA4M1 SoC linker include file
+(`soc/renesas/ra/ra4m1/rom_start.ld`) uses:
+
+```ld
+. = DT_REG_ADDR(DT_NODELABEL(option_setting_ofs0));
 ```
-ld.lld: error: duplicate symbol: __retarget_lock_acquire
-```
 
-Zephyr's picolibc lock wrappers and the SDK's bundled picolibc both define
-`__retarget_lock_*` symbols. GNU ld resolves these via archive ordering and
-weak symbol semantics, but lld is stricter. This can be worked around with
-`-Wl,--allow-multiple-definition`, but exposes the next issue.
+which preprocesses to `. = 1024;`. Inside an output section, GNU ld treats
+this as a section-relative offset (VMA = section_start + 1024). LLVM lld
+treats it as an absolute VMA (0x400), which is before the section start at
+0x4000, causing a "unable to move location counter backward" error.
 
-### 2. Linker Script Incompatibilities
+**Workaround:** Requires patching the Zephyr source file to use
+`__rom_start_address + DT_REG_ADDR(...)` under `#ifdef __LLD_LINKER_CMD__`.
+Zephyr already defines `__LLD_LINKER_CMD__` when using lld, and the same
+pattern is used in `arch/common/rom_start_offset.ld`.
 
-```
-ld.lld: error: unable to place section rom_start at file offset [...]; check your linker script for overflows
-ld.lld: error: section text virtual address range overlaps with rom_start
-```
+**Upstream fix:** This is a bug in the Renesas RA4M1 SoC's `rom_start.ld`.
+The same issue likely affects other Renesas RA SoCs. The fix is minimal
+(conditional `#ifdef`) and follows existing Zephyr conventions.
 
-Zephyr's linker scripts (and the Renesas RA SoC-specific linker scripts) use
-GNU ld extensions and section placement conventions that lld interprets
-differently, resulting in address space layout errors.
+### 3. Missing POSIX Syscall Stubs
 
-### Next Steps for lld Investigation
+**Problem:** lld resolves archive symbols more aggressively than GNU ld. It
+pulls in reentrant wrappers (`_sbrk_r`, `_read_r`, etc.) from the SDK's
+bundled `libc.a` that reference POSIX syscall stubs (`_sbrk`, `_read`,
+`_write`, `_close`, `_lseek`, `_fstat`, `_isatty`). GNU ld does not pull
+these in because Zephyr's picolibc layer satisfies the needed symbols earlier
+in archive resolution order.
 
-- Upstream Zephyr issue [#41776](https://github.com/zephyrproject-rtos/zephyr/issues/41776)
-  tracks `-fuse-ld=lld` support on `qemu_x86`; similar work would be needed
-  for ARM targets.
-- The linker script incompatibilities may require lld-specific linker script
-  variants (Zephyr already has `linker-tool-lld.h` for preprocessor macros).
-- The duplicate symbol issue could potentially be resolved by adjusting
-  Zephyr's picolibc integration or using `--allow-multiple-definition` as a
-  linker flag.
-- Testing on simpler boards (e.g., `qemu_cortex_m3`) where the linker script
-  is less complex may yield better results.
+**Workaround:** `src/syscall_stubs.c` provides weak stub implementations
+that return appropriate error values. These are harmlessly ignored in ld.bfd
+builds.
+
+**Upstream fix:** This is a consequence of lld's different (arguably more
+correct) archive resolution. Zephyr could provide these stubs in its picolibc
+integration layer, or the link order could be adjusted so `-lc` is not needed
+when picolibc is the configured libc.
+
+## Upstream Fixes Required
+
+To build with lld without workarounds, the following upstream changes are needed:
+
+| Component | Issue | Severity |
+|-----------|-------|----------|
+| **Zephyr SDK** | `cmake/zephyr/generic.cmake` hardcodes `set(LINKER ld)` — should allow override | Medium |
+| **Zephyr** | `soc/renesas/ra/ra4m1/rom_start.ld` uses bare `. = constant` inside output section — incompatible with lld | **High** |
+| **Zephyr** | `lib/libc/picolibc/locks.c` defines strong `__retarget_lock_*` that collide with SDK picolibc | Medium |
+| **Zephyr** | Missing weak POSIX syscall stubs for lld's archive resolution behavior | Low |
 
 ## Project Structure
 
@@ -218,14 +252,16 @@ differently, resulting in address space layout errors.
 ├── CMakeLists.txt                          # Zephyr application build file
 ├── prj.conf                                # Kconfig: enables GPIO driver
 ├── src/
-│   └── main.c                              # LED blink pattern
+│   ├── main.c                              # LED blink pattern
+│   └── syscall_stubs.c                     # Weak POSIX stubs for lld compat
 ├── cmake/
 │   ├── toolchain/zephyr-lld/
 │   │   ├── generic.cmake                   # Custom variant: SDK + lld override
 │   │   └── target.cmake                    # Delegates to SDK target config
 │   ├── compiler/gcc/                       # Forwarders to ${ZEPHYR_BASE}
-│   ├── linker/lld/                         # Forwarders to ${ZEPHYR_BASE}
+│   ├── linker/lld/                         # Forwarders + lld-specific flags
 │   └── bintools/gnu/                       # Forwarders to ${ZEPHYR_BASE}
+├── patches/                                # Zephyr source patches (see below)
 └── README.md
 ```
 
